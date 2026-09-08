@@ -42,6 +42,30 @@ from torch.utils.cpp_extension import load
 HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
 STATE_TUNING = os.environ.get("RWKV_TRAIN_TYPE", "normal") == "state"
 
+def _uninitialized_module(factory):
+    """Allocate module parameters without running their default initializers.
+
+    State tuning always loads a complete frozen base checkpoint immediately after
+    construction, so initializing billions of values first is pure overhead.
+    """
+    if not STATE_TUNING:
+        return factory()
+    with torch.device('meta'):
+        module = factory()
+    return module.to_empty(device=torch.device('cpu'))
+
+def _linear(in_features, out_features, bias=False):
+    return _uninitialized_module(lambda: nn.Linear(in_features, out_features, bias=bias))
+
+def _embedding(num_embeddings, embedding_dim):
+    return _uninitialized_module(lambda: nn.Embedding(num_embeddings, embedding_dim))
+
+def _layer_norm(normalized_shape):
+    return _uninitialized_module(lambda: nn.LayerNorm(normalized_shape))
+
+def _group_norm(num_groups, num_channels, eps):
+    return _uninitialized_module(lambda: nn.GroupNorm(num_groups, num_channels, eps=eps))
+
 class LayerState(NamedTuple):
     """The recurrent state carried from one sequence chunk to the next."""
     wkv_state: torch.Tensor       # [B, H, N, N], fp32
@@ -596,78 +620,87 @@ class RWKV_Tmix_x070(MyModule):
         N = self.head_size
         C = args.n_embd
 
-        with torch.no_grad():
-            ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, C)
-            for i in range(C):
-                ddd[0, 0, i] = i / C
+        if STATE_TUNING:
+            # All of these are overwritten by the required base checkpoint.
+            # Do not spend startup time filling them before load_state_dict().
+            def param(*shape):
+                return nn.Parameter(torch.empty(*shape))
+            D_DECAY_LORA, D_AAA_LORA, D_MV_LORA, D_GATE_LORA = 128, 128, 96, 480
+            self.x_r = param(1, 1, C); self.x_w = param(1, 1, C)
+            self.x_k = param(1, 1, C); self.x_v = param(1, 1, C)
+            self.x_a = param(1, 1, C); self.x_g = param(1, 1, C)
+            self.w1 = param(C, D_DECAY_LORA); self.w2 = param(D_DECAY_LORA, C); self.w0 = param(1, 1, C)
+            self.a1 = param(C, D_AAA_LORA); self.a2 = param(D_AAA_LORA, C); self.a0 = param(1, 1, C)
+            self.v1 = param(C, D_MV_LORA); self.v2 = param(D_MV_LORA, C); self.v0 = param(1, 1, C)
+            self.g1 = param(C, D_GATE_LORA); self.g2 = param(D_GATE_LORA, C)
+            self.k_k = param(1, 1, C); self.k_a = param(1, 1, C); self.r_k = param(H, N)
+            # This is the sole new parameter and deliberately starts at zero.
+            self.time_state = nn.Parameter(torch.zeros(H, N, N, dtype=torch.float32))
+        else:
+            with torch.no_grad():
+                ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
+                ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+                ddd = torch.ones(1, 1, C)
+                for i in range(C):
+                    ddd[0, 0, i] = i / C
 
-            self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-            self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
-            self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
-            self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+                self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+                self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+                self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+                self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+                self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+                self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
 
-            def ortho_init(x, scale):
-                with torch.no_grad():
-                    shape = x.shape
-                    if len(shape) == 2:
-                        gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1
-                        nn.init.orthogonal_(x, gain=gain * scale)
-                    elif len(shape) == 3:
-                        gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1
-                        for i in range(shape[0]):
-                            nn.init.orthogonal_(x[i], gain=gain * scale)
-                    else:
-                        assert False
-                    return x
+                def ortho_init(x, scale):
+                    with torch.no_grad():
+                        shape = x.shape
+                        if len(shape) == 2:
+                            gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1
+                            nn.init.orthogonal_(x, gain=gain * scale)
+                        elif len(shape) == 3:
+                            gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1
+                            for i in range(shape[0]):
+                                nn.init.orthogonal_(x[i], gain=gain * scale)
+                        else:
+                            assert False
+                        return x
 
-            www = torch.zeros(C)
-            zigzag = torch.zeros(C)
-            linear = torch.zeros(C)
-            for n in range(C):
-                linear[n] = n / (C-1) - 0.5
-                zigzag[n] = ((n % N) - ((N-1) / 2)) / ((N-1) / 2)
-                zigzag[n] = zigzag[n] * abs(zigzag[n])
-                www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
+                www = torch.zeros(C)
+                zigzag = torch.zeros(C)
+                linear = torch.zeros(C)
+                for n in range(C):
+                    linear[n] = n / (C-1) - 0.5
+                    zigzag[n] = ((n % N) - ((N-1) / 2)) / ((N-1) / 2)
+                    zigzag[n] = zigzag[n] * abs(zigzag[n])
+                    www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-            D_DECAY_LORA = 128# suggestion
-            self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
-            self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
-            self.w0 = nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)
+                D_DECAY_LORA = 128
+                self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
+                self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
+                self.w0 = nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)
+                D_AAA_LORA = 128
+                self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
+                self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
+                self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
+                D_MV_LORA = 96
+                self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
+                self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
+                self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
+                D_GATE_LORA = 480
+                self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
+                self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
+                self.k_k = nn.Parameter(torch.zeros(1,1,C)+0.71 - linear*0.1)
+                self.k_a = nn.Parameter(torch.zeros(1,1,C)+1.02)
+                self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
 
-            D_AAA_LORA = 128# suggestion
-            self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
-            self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
-            self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        self.receptance = _linear(C, C, bias=False)
+        self.key = _linear(C, C, bias=False)
+        self.value = _linear(C, C, bias=False)
+        self.output = _linear(C, C, bias=False)
+        self.ln_x = _group_norm(H, C, eps=64e-5) # !!! notice eps value !!!
 
-            D_MV_LORA = 96# suggestion
-            self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
-            self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
-            self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
-
-            # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-            D_GATE_LORA = 480# suggestion
-            self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
-            self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
-
-            self.k_k = nn.Parameter(torch.zeros(1,1,C)+0.71 - linear*0.1)
-            self.k_a = nn.Parameter(torch.zeros(1,1,C)+1.02)
-            self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
-            # Only this initial recurrent state is trainable in --train_type state.
-            # Shift states intentionally remain zero, matching prior state-tuning semantics.
-            if STATE_TUNING:
-                self.time_state = nn.Parameter(torch.zeros(H, N, N, dtype=torch.float32))
-
-            self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-            self.receptance = nn.Linear(C, C, bias=False)
-            self.key = nn.Linear(C, C, bias=False)
-            self.value = nn.Linear(C, C, bias=False)
-            self.output = nn.Linear(C, C, bias=False)
-            self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
-
+        if not STATE_TUNING:
             self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
             self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
             self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
@@ -813,18 +846,22 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
         self.args = args
         self.layer_id = layer_id
 
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, args.n_embd)
-            for i in range(args.n_embd):
-                ddd[0, 0, i] = i / args.n_embd
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+        if STATE_TUNING:
+            self.x_k = nn.Parameter(torch.empty(1, 1, args.n_embd))
+        else:
+            with torch.no_grad():
+                ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+                ddd = torch.ones(1, 1, args.n_embd)
+                for i in range(args.n_embd):
+                    ddd[0, 0, i] = i / args.n_embd
+                self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
 
-        self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
-        self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
+        self.key = _linear(args.n_embd, args.n_embd * 4, bias=False)
+        self.value = _linear(args.n_embd * 4, args.n_embd, bias=False)
 
-        self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
-        self.value.weight.data.zero_()
+        if not STATE_TUNING:
+            self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
+            self.value.weight.data.zero_()
 
     def forward(self, x, ffn_shift=None):
         if ffn_shift is None:
@@ -843,11 +880,11 @@ class Block(nn.Module):
         self.args = args
         self.layer_id = layer_id
 
-        self.ln1 = nn.LayerNorm(args.n_embd)
-        self.ln2 = nn.LayerNorm(args.n_embd)
+        self.ln1 = _layer_norm(args.n_embd)
+        self.ln2 = _layer_norm(args.n_embd)
 
         if self.layer_id == 0:
-            self.ln0 = nn.LayerNorm(args.n_embd)
+            self.ln0 = _layer_norm(args.n_embd)
 
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
@@ -902,12 +939,12 @@ class RWKV(pl.LightningModule):
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
 
-        self.emb = nn.Embedding(args.vocab_size, args.n_embd)
+        self.emb = _embedding(args.vocab_size, args.n_embd)
 
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
 
-        self.ln_out = nn.LayerNorm(args.n_embd)
-        self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        self.ln_out = _layer_norm(args.n_embd)
+        self.head = _linear(args.n_embd, args.vocab_size, bias=False)
 
     def configure_optimizers(self):
         args = self.args

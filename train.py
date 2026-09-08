@@ -70,6 +70,8 @@ if __name__ == "__main__":
         assert args.chunk_ctx > 0 and args.chunk_ctx % 16 == 0, '--chunk_ctx must be a positive multiple of 16'
         assert args.ctx_len % args.chunk_ctx == 0, '--ctx_len must be divisible by --chunk_ctx'
         assert 'deepspeed_stage_3' not in args.strategy, 'state tuning checkpoints are state-only; use stage 1/2'
+        assert args.load_model and args.load_model != '0', '--train_type state requires a complete --load_model base checkpoint'
+        assert args.train_stage != 1, '--train_type state cannot generate an initialization checkpoint'
 
     ########################################################################################################
 
