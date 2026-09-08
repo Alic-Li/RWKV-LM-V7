@@ -11,4 +11,5 @@ out/*
 *.pyc
 .vscode/
 wandb/
-
+XML_tool_use_state_tuning/
+XML_tool_use_state_tuning_no_system/

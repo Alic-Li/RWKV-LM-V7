@@ -16,6 +16,8 @@ if __name__ == "__main__":
     parser = ArgumentParser()
 
     parser.add_argument("--load_model", default="", type=str)  # full path, with .pth
+    parser.add_argument("--load_state", default="", type=str,
+                        help="state-tuning checkpoint containing only blocks.*.att.time_state")
     parser.add_argument("--wandb", default="", type=str)  # wandb project name. if "" then don't use wandb
     parser.add_argument("--proj_dir", default="out", type=str)
     parser.add_argument("--random_seed", default="-1", type=int)
@@ -25,6 +27,10 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
 
     parser.add_argument("--ctx_len", default=1024, type=int)
+    parser.add_argument("--train_type", default="normal", choices=["normal", "state"])
+    parser.add_argument("--chunk_ctx", default=1024, type=int)
+    parser.add_argument("--state_detach", default=0, type=int,
+                        help="1 enables truncated BPTT for state tuning; 0 keeps gradients across chunks")
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
@@ -60,6 +66,11 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
+    if args.train_type == 'state':
+        assert args.chunk_ctx > 0 and args.chunk_ctx % 16 == 0, '--chunk_ctx must be a positive multiple of 16'
+        assert args.ctx_len % args.chunk_ctx == 0, '--ctx_len must be divisible by --chunk_ctx'
+        assert 'deepspeed_stage_3' not in args.strategy, 'state tuning checkpoints are state-only; use stage 1/2'
+
     ########################################################################################################
 
     import os, warnings, math, datetime, sys, time
@@ -92,6 +103,7 @@ if __name__ == "__main__":
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     os.environ["RWKV_MY_TESTING"] = args.my_testing
     os.environ["RWKV_KERNEL"] = args.kernel
+    os.environ["RWKV_TRAIN_TYPE"] = args.train_type
     os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
     os.environ["RWKV_HEAD_SIZE"] = str(args.head_size)
     os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(args.head_chunk)
@@ -120,16 +132,31 @@ if __name__ == "__main__":
                         p = int(p)
                     list_p += [p]
         list_p.sort()
-        max_p = list_p[-1]
-        if len(list_p) > 1:
-            args.my_pile_prev_p = list_p[-2]  # in case max_p is corrupted
-        if max_p == -1:
-            args.load_model = f"{args.proj_dir}/rwkv-init.pth"
+        if list_p:
+            max_p = list_p[-1]
+            if len(list_p) > 1:
+                args.my_pile_prev_p = list_p[-2]  # in case max_p is corrupted
+            checkpoint_path = f"{args.proj_dir}/rwkv-init.pth" if max_p == -1 else f"{args.proj_dir}/rwkv-{max_p}.pth"
+            if args.train_type == 'state':
+                # State checkpoints intentionally contain only time_state. Keep
+                # the user-supplied base model and layer this checkpoint on top.
+                if not args.load_model or args.load_model == '0':
+                    raise FileNotFoundError('--train_type state resume requires --load_model BASE.pth')
+                args.load_state = checkpoint_path
+            else:
+                args.load_model = checkpoint_path
+                if max_p != -1 and args.warmup_steps < 0:
+                    args.warmup_steps = 10
+            args.epoch_begin = max_p + 1
         else:
-            args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-            if args.warmup_steps < 0:
-                args.warmup_steps = 10
-        args.epoch_begin = max_p + 1
+            # A fresh fine-tune commonly has an empty project directory. Keep an
+            # explicitly supplied base model instead of indexing an empty list.
+            if not args.load_model or args.load_model == '0':
+                raise FileNotFoundError(
+                    f'No rwkv-*.pth found in {args.proj_dir}. Provide --load_model BASE.pth '
+                    'for a fresh run, or put rwkv-init.pth in that directory.'
+                )
+            rank_zero_info(f'No resumable checkpoint in {args.proj_dir}; starting from --load_model {args.load_model}')
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
@@ -176,7 +203,7 @@ if __name__ == "__main__":
     if args.precision == "fp16":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
 
-    os.environ["RWKV_JIT_ON"] = "1"
+    os.environ["RWKV_JIT_ON"] = "0" if args.train_type == 'state' else "1"
     if "deepspeed_stage_3" in args.strategy:
         os.environ["RWKV_JIT_ON"] = "0" # somehow incompatible
 
@@ -237,7 +264,22 @@ if __name__ == "__main__":
         for k in model.state_dict():
             if k not in load_keys:
                 load_dict[k] = model.state_dict()[k]
-    model.load_state_dict(load_dict)
+    incompatible = model.load_state_dict(load_dict, strict=(args.train_type != 'state'))
+    if args.train_type == 'state':
+        expected_missing = {f'blocks.{i}.att.time_state' for i in range(args.n_layer)}
+        assert set(incompatible.missing_keys) <= expected_missing, incompatible.missing_keys
+        assert not incompatible.unexpected_keys, incompatible.unexpected_keys
+        for name, param in model.named_parameters():
+            param.requires_grad = name.endswith('att.time_state')
+        trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
+        assert len(trainable) == args.n_layer and all(n.endswith('att.time_state') for n, _ in trainable), trainable
+        rank_zero_info(f'State tuning: frozen base model; trainable={trainable}')
+        if args.load_state:
+            state_dict = torch.load(args.load_state, map_location='cpu', weights_only=True)
+            state_result = model.load_state_dict(state_dict, strict=False)
+            assert not state_result.unexpected_keys, state_result.unexpected_keys
+            assert not [k for k in state_dict if not k.endswith('att.time_state')]
+            rank_zero_info(f'Loaded state-tuning parameters from {args.load_state}')
 
     trainer = Trainer.from_argparse_args(
         args,

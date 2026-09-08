@@ -1,4 +1,4 @@
-import os, math, time, datetime, subprocess
+import os, math, time, datetime, subprocess, json
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
@@ -9,6 +9,18 @@ def my_save(args, trainer, dd, ff):
         trainer.save_checkpoint(ff, weights_only=True)
     else:
         torch.save(dd, ff)
+    if args.train_type == 'state' and trainer.is_global_zero:
+        with open(ff + '.json', 'w') as f:
+            json.dump({
+                'model_version': 'RWKV-LM-V7',
+                'n_layer': args.n_layer,
+                'n_embd': args.n_embd,
+                'head_size': args.head_size,
+                'vocab_size': args.vocab_size,
+            }, f, indent=2, sort_keys=True)
+
+def save_dict_for_run(args, pl_module):
+    return pl_module.state_tuning_state_dict() if args.train_type == 'state' else pl_module.state_dict()
 
 class train_callback(pl.Callback):
     def __init__(self, args):
@@ -38,7 +50,7 @@ class train_callback(pl.Callback):
                 if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy):
                     my_save(
                         args, trainer,
-                        pl_module.state_dict(),
+                        save_dict_for_run(args, pl_module),
                         f"{args.proj_dir}/rwkv-final.pth",
                     )
                     exit(0)
@@ -110,7 +122,7 @@ class train_callback(pl.Callback):
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
             if args.magic_prime > 0:
                 if int(real_step) == int(args.magic_prime // args.real_bsz) - 1:
-                    to_save_dict = pl_module.state_dict()
+                    to_save_dict = save_dict_for_run(args, pl_module)
                     my_save(
                         args, trainer,
                         to_save_dict,
@@ -138,7 +150,7 @@ class train_callback(pl.Callback):
                         if k.startswith('encoder.') or k.startswith('decoder.'):
                             to_save_dict[k] = raw_dict[k]
                 else:
-                    to_save_dict = pl_module.state_dict()
+                    to_save_dict = save_dict_for_run(args, pl_module)
                 try:
                     my_save(
                         args, trainer,

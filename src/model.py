@@ -3,6 +3,7 @@
 ########################################################################################################
 
 import os, sys, math, gc, importlib
+from typing import NamedTuple
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -39,6 +40,13 @@ if os.environ["RWKV_JIT_ON"] == "1":
 from torch.utils.cpp_extension import load
 
 HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
+STATE_TUNING = os.environ.get("RWKV_TRAIN_TYPE", "normal") == "state"
+
+class LayerState(NamedTuple):
+    """The recurrent state carried from one sequence chunk to the next."""
+    wkv_state: torch.Tensor       # [B, H, N, N], fp32
+    att_shift: torch.Tensor       # [B, C], bf16
+    ffn_shift: torch.Tensor       # [B, C], bf16
 
 if 'x070' in os.environ["RWKV_MY_TESTING"]:
     CHUNK_LEN = 16
@@ -62,6 +70,11 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
             load(name="rwkv7_clampw", sources=['hip/rwkv7_clampw_op.hip', 'hip/rwkv7_clampw.hip'], is_python_module=False, verbose=True, extra_cuda_cflags=flags_rocm)
         else:
             load(name="rwkv7_clampw", sources=['cuda/rwkv7_clampw.cu', 'cuda/rwkv7_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+    if STATE_TUNING:
+        if ROCm_flag:
+            raise RuntimeError("--train_type state currently requires CUDA: the state-passing HIP kernel has not been ported.")
+        RWKV7_STATEPASS_OP = torch.ops.rwkv7_statepassing_clampw
+        load(name="rwkv7_statepassing_clampw", sources=['cuda/rwkv7_statepassing_clampw.cu', 'cuda/rwkv7_statepassing_clampw.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
     class RWKV7_CLAMPW_CUDA_OP(torch.autograd.Function):
         @staticmethod
         def forward(ctx,r,w,k,v,a,b):
@@ -87,6 +100,43 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         B,T,HN = r.shape
         r,w,k,v,a,b = [i.view(B,T,HN//64,64) for i in [r,w,k,v,a,b]] # can change 64 to your HEAD_SIZE. have to hard-code the number here, or pytorch will complain
         return RWKV7_CLAMPW_CUDA_OP.apply(r,w,k,v,a,b).view(B,T,HN)
+
+    if STATE_TUNING:
+        class RWKV7_STATEPASS_OP_AUTOGRAD(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, state_in, r, w, k, v, a, b):
+                B, T, H, N = r.shape
+                assert T % CHUNK_LEN == 0
+                assert state_in.shape == (B, H, N, N)
+                assert state_in.dtype == torch.float32
+                assert all(x.dtype == torch.bfloat16 for x in (r, w, k, v, a, b))
+                state_in = state_in.contiguous()
+                r, w, k, v, a, b = (x.contiguous() for x in (r, w, k, v, a, b))
+                y = torch.empty_like(v)
+                state_out = torch.empty_like(state_in)
+                saved_state = torch.empty(B, H, T // CHUNK_LEN, N, N, dtype=torch.float32, device=r.device)
+                sa = torch.empty(B, T, H, N, dtype=torch.float32, device=r.device)
+                RWKV7_STATEPASS_OP.forward(state_in, r, w, k, v, a, b, y, state_out, saved_state, sa)
+                ctx.save_for_backward(r, w, k, v, a, b, state_out, saved_state, sa)
+                return y, state_out
+
+            @staticmethod
+            def backward(ctx, dy, dstate_out):
+                r, w, k, v, a, b, state_out, saved_state, sa = ctx.saved_tensors
+                dy = dy.contiguous()
+                dstate_out = torch.zeros_like(state_out) if dstate_out is None else dstate_out.contiguous()
+                dstate_in = torch.empty_like(state_out)
+                dr, dw, dk, dv, da, db = (torch.empty_like(x) for x in (r, w, k, v, a, b))
+                RWKV7_STATEPASS_OP.backward(r, w, k, v, a, b, dy, dstate_out, saved_state, sa, dstate_in, dr, dw, dk, dv, da, db)
+                return dstate_in, dr, dw, dk, dv, da, db
+
+        def RWKV7_STATEPASS(state_in, r, w, k, v, a, b):
+            B, T, C = r.shape
+            H, N = state_in.shape[1:3]
+            assert C == H * N and N == HEAD_SIZE
+            tensors = [x.view(B, T, H, N) for x in (r, w, k, v, a, b)]
+            y, state_out = RWKV7_STATEPASS_OP_AUTOGRAD.apply(state_in, *tensors)
+            return y.view(B, T, C), state_out
 
 ########################################################################################################
 if ROCm_flag:
@@ -157,7 +207,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
+def _tmix_mix6_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
     return torch.ops.rwkv7_tmix_mix6_bf16_v5.forward(
         x.contiguous(),
         x_r.contiguous(),
@@ -186,7 +236,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
-        return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+        return tuple(_tmix_mix6_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 if ROCm_flag:
@@ -229,7 +279,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(k, k_k, a, k_a):
+def _tmix_kk_pre_forward_op(k, k_k, a, k_a):
     outs = torch.ops.rwkv7_tmix_kk_pre_bf16_v5.forward(
         k.contiguous(),
         k_k.contiguous(),
@@ -260,7 +310,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_kk_pre_bf16_v5_jit(k, k_k, a, k_a)
 else:
     def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
-        return tuple(_forward_op(k, k_k, a, k_a))
+        return tuple(_tmix_kk_pre_forward_op(k, k_k, a, k_a))
 
 ########################################################################################################
 if ROCm_flag:
@@ -301,7 +351,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(x, r, k, v, r_k, weight, bias, g):
+def _tmix_lnx_rkvres_xg_forward_op(x, r, k, v, r_k, weight, bias, g):
     outs = torch.ops.rwkv7_tmix_lnx_rkvres_xg_bf16_v1.forward(
         x.contiguous(),
         r.contiguous(),
@@ -342,7 +392,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_lnx_rkvres_xg_bf16_v1_jit(x, r, k, v, r_k, weight, bias, g)
 else:
     def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
-        return _forward_op(x, r, k, v, r_k, weight, bias, g)
+        return _tmix_lnx_rkvres_xg_forward_op(x, r, k, v, r_k, weight, bias, g)
 
 ########################################################################################################
 if ROCm_flag:
@@ -373,7 +423,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(a0, a12):
+def _tmix_a_gate_forward_op(a0, a12):
     return torch.ops.rwkv7_tmix_a_gate_bf16.forward(
         a0.contiguous(),
         a12.contiguous(),
@@ -394,7 +444,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_a_gate_bf16_jit(a0, a12)
 else:
     def tmix_a_gate_bf16(a0, a12):
-        return _forward_op(a0, a12)
+        return _tmix_a_gate_forward_op(a0, a12)
 
 ########################################################################################################
 if ROCm_flag:
@@ -429,7 +479,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(v, v_first, v0, v12):
+def _tmix_vres_gate_forward_op(v, v_first, v0, v12):
     return torch.ops.rwkv7_tmix_vres_gate_bf16_v1.forward(
         v.contiguous(),
         v_first.contiguous(),
@@ -456,7 +506,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_vres_gate_bf16_v1_jit(v, v_first, v0, v12)
 else:
     def tmix_vres_gate_bf16_v1(v, v_first, v0, v12):
-        return _forward_op(v, v_first, v0, v12)
+        return _tmix_vres_gate_forward_op(v, v_first, v0, v12)
 
 ########################################################################################################
 if ROCm_flag:
@@ -583,29 +633,33 @@ class RWKV_Tmix_x070(MyModule):
                 zigzag[n] = zigzag[n] * abs(zigzag[n])
                 www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-            D_DECAY_LORA = max(32, int(round(  (2.5*(C**0.5))  /32)*32)) # suggestion
+            D_DECAY_LORA = 128# suggestion
             self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
             self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
             self.w0 = nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)
 
-            D_AAA_LORA = max(32, int(round(  (2.5*(C**0.5))  /32)*32)) # suggestion
+            D_AAA_LORA = 128# suggestion
             self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
             self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
             self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
 
-            D_MV_LORA = max(32, int(round(  (1.7*(C**0.5))  /32)*32)) # suggestion
+            D_MV_LORA = 96# suggestion
             self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
             self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
             self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
 
             # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-            D_GATE_LORA = max(32, int(round(  (5*(C**0.5))  /32)*32)) # suggestion
+            D_GATE_LORA = 480# suggestion
             self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
             self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
 
             self.k_k = nn.Parameter(torch.zeros(1,1,C)+0.71 - linear*0.1)
             self.k_a = nn.Parameter(torch.zeros(1,1,C)+1.02)
             self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
+            # Only this initial recurrent state is trainable in --train_type state.
+            # Shift states intentionally remain zero, matching prior state-tuning semantics.
+            if STATE_TUNING:
+                self.time_state = nn.Parameter(torch.zeros(H, N, N, dtype=torch.float32))
 
             self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
             self.receptance = nn.Linear(C, C, bias=False)
@@ -620,7 +674,7 @@ class RWKV_Tmix_x070(MyModule):
             self.output.weight.data.zero_()
 
     @MyFunction
-    def forward(self, x, v_first):
+    def forward(self, x, v_first, wkv_state=None, att_shift=None):
         B, T, C = x.size()
         H = self.n_head
 
@@ -635,15 +689,22 @@ class RWKV_Tmix_x070(MyModule):
         # xg = x + xx * self.x_g
         ############################################################
         # much faster CUDA version
-        xr, xw, xk, xv, xa, xg = tmix_mix6_bf16_v5(
-            x,
-            self.x_r.view(-1),
-            self.x_w.view(-1),
-            self.x_k.view(-1),
-            self.x_v.view(-1),
-            self.x_a.view(-1),
-            self.x_g.view(-1),
-        )
+        if att_shift is None:
+            xr, xw, xk, xv, xa, xg = tmix_mix6_bf16_v5(
+                x, self.x_r.view(-1), self.x_w.view(-1), self.x_k.view(-1),
+                self.x_v.view(-1), self.x_a.view(-1), self.x_g.view(-1))
+        else:
+            # The existing fused kernel assumes a zero predecessor at t=0.  Keep
+            # the fused path for normal training; this differentiable reference
+            # path makes chunked state passing exactly match a full sequence.
+            x_prev = torch.cat((att_shift[:, None], x[:, :-1]), dim=1)
+            xx = x_prev - x
+            xr = x + xx * self.x_r
+            xw = x + xx * self.x_w
+            xk = x + xx * self.x_k
+            xv = x + xx * self.x_v
+            xa = x + xx * self.x_a
+            xg = x + xx * self.x_g
         ############################################################
 
         r = self.receptance(xr)
@@ -686,7 +747,11 @@ class RWKV_Tmix_x070(MyModule):
             a,
             self.k_a.view(-1),
         )
-        x = RWKV7_CLAMPW_CUDA(r, w, k, v, neg_kk, kka)
+        if wkv_state is None:
+            x = RWKV7_CLAMPW_CUDA(r, w, k, v, neg_kk, kka)
+            wkv_state_out = None
+        else:
+            x, wkv_state_out = RWKV7_STATEPASS(wkv_state, r, w, k, v, neg_kk, kka)
         ############################################################
 
         ############################################################
@@ -709,7 +774,7 @@ class RWKV_Tmix_x070(MyModule):
         x = self.output(x)
         ############################################################
 
-        return x, v_first
+        return x, v_first, wkv_state_out
 
 ########################################################################################################
 
@@ -761,8 +826,12 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
         self.value.weight.data.zero_()
 
-    def forward(self, x):
-        return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
+    def forward(self, x, ffn_shift=None):
+        if ffn_shift is None:
+            return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
+        x_prev = torch.cat((ffn_shift[:, None], x[:, :-1]), dim=1)
+        k = x + (x_prev - x) * self.x_k
+        return self.value(torch.relu(self.key(k)) ** 2)
 
 ########################################################################################################
 # The RWKV Model with our blocks
@@ -783,15 +852,26 @@ class Block(nn.Module):
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
 
-    def forward(self, x, v_first):
+    def forward(self, x, v_first, state_in=None):
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first)
+        x1 = self.ln1(x)
+        if state_in is None:
+            x_attn, v_first, _ = self.att(x1, v_first)
+        else:
+            x_attn, v_first, wkv_state = self.att(x1, v_first, state_in.wkv_state, state_in.att_shift)
         x = x + x_attn
 
-        x = x + self.ffn(self.ln2(x))
-        return x, v_first
+        x2 = self.ln2(x)
+        x = x + self.ffn(x2, None if state_in is None else state_in.ffn_shift)
+        if state_in is None:
+            return x, v_first
+        return x, v_first, LayerState(wkv_state, x1[:, -1], x2[:, -1])
+
+    def forward_state(self, x, v_first, wkv_state, att_shift, ffn_shift):
+        x, v_first, state_out = self.forward(x, v_first, LayerState(wkv_state, att_shift, ffn_shift))
+        return x, v_first, state_out.wkv_state, state_out.att_shift, state_out.ffn_shift
 
 
 # class L2Wrap(torch.autograd.Function): # avoid: very slow and takes lots of vram
@@ -831,6 +911,17 @@ class RWKV(pl.LightningModule):
 
     def configure_optimizers(self):
         args = self.args
+
+        if getattr(args, 'train_type', 'normal') == 'state':
+            trainable = [(n, p.numel()) for n, p in self.named_parameters() if p.requires_grad]
+            assert len(trainable) == args.n_layer, trainable
+            assert all(n.endswith('att.time_state') for n, _ in trainable), trainable
+            if self.trainer.is_global_zero:
+                print('state tuning trainable parameters:', trainable)
+            return FusedAdam([{'params': [p for _, p in self.named_parameters() if p.requires_grad],
+                               'weight_decay': 0.0, 'my_lr_scale': 1.0}],
+                             lr=args.lr_init, betas=args.betas, eps=args.adam_eps,
+                             bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
 
         lr_decay = set()
         lr_1x = set()
@@ -877,7 +968,49 @@ class RWKV(pl.LightningModule):
             return cfg.get("offload_optimizer") or cfg.get("offload_param")
         return False
 
-    def _forward_features(self, idx):
+    def init_trainable_state(self, batch_size, device=None):
+        """Create the first chunk state. Gradients flow through expand to time_state."""
+        states = []
+        for block in self.blocks:
+            # Keep recurrent state fp32 even if the training engine stores model
+            # weights in bf16; the cast remains connected to time_state's grad.
+            wkv = block.att.time_state.float().unsqueeze(0).expand(batch_size, -1, -1, -1)
+            if device is not None:
+                wkv = wkv.to(device)
+            states.append(LayerState(
+                wkv,
+                torch.zeros(batch_size, self.args.n_embd, dtype=torch.bfloat16, device=wkv.device),
+                torch.zeros(batch_size, self.args.n_embd, dtype=torch.bfloat16, device=wkv.device),
+            ))
+        return states
+
+    @staticmethod
+    def detach_state(state):
+        return [LayerState(s.wkv_state.detach(), s.att_shift.detach(), s.ffn_shift.detach()) for s in state]
+
+    def state_tuning_state_dict(self):
+        return {n: p.detach().cpu() for n, p in self.named_parameters() if n.endswith('att.time_state')}
+
+    def _state_training_step(self, idx, targets):
+        state = self.init_trainable_state(idx.size(0), idx.device)
+        total_loss = 0.0
+        chunk = self.args.chunk_ctx
+        for start in range(0, idx.size(1), chunk):
+            input_chunk = idx[:, start:start + chunk]
+            target_chunk = targets[:, start:start + chunk]
+            result = self(input_chunk, state)
+            if int(os.environ['RWKV_HEAD_L2WRAP_CE_CHUNK']) > 0:
+                hidden, state = result
+                loss = head_l2wrap_cross_entropy(hidden, self.head.weight, target_chunk)
+            else:
+                logits, state = result
+                loss = l2wrap_cross_entropy(logits, target_chunk)
+            total_loss = total_loss + loss * (input_chunk.size(1) / idx.size(1))
+            if self.args.state_detach:
+                state = self.detach_state(state)
+        return total_loss
+
+    def _forward_features(self, idx, state=None):
         args = self.args
         B, T = idx.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
@@ -885,34 +1018,53 @@ class RWKV(pl.LightningModule):
         x = self.emb(idx)
 
         v_first = torch.empty_like(x)
-        for block in self.blocks:
-            if args.grad_cp == 1:
+        state_out = []
+        for layer_id, block in enumerate(self.blocks):
+            if state is not None:
+                # checkpoint supports the NamedTuple state input and preserves its
+                # state_out autograd edge, so state_detach=0 is full BPTT.
+                if args.grad_cp == 1:
+                    x, v_first, wkv, att_shift, ffn_shift = deepspeed.checkpointing.checkpoint(
+                        block.forward_state, x, v_first, state[layer_id].wkv_state,
+                        state[layer_id].att_shift, state[layer_id].ffn_shift)
+                    layer_state = LayerState(wkv, att_shift, ffn_shift)
+                else:
+                    x, v_first, layer_state = block(x, v_first, state[layer_id])
+                state_out.append(layer_state)
+            elif args.grad_cp == 1:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
             else:
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
-        return x
+        return (x, state_out) if state is not None else x
 
     if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
 
-        def forward(self, idx):
-            return self._forward_features(idx)
+        def forward(self, idx, state=None):
+            features = self._forward_features(idx, state)
+            return features
 
         def training_step(self, batch, batch_idx):
             idx, targets = batch
+            if getattr(self.args, 'train_type', 'normal') == 'state':
+                return self._state_training_step(idx, targets)
             hidden = self(idx)
             return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
 
     else:
 
-        def forward(self, idx):
-            x = self._forward_features(idx)
-            x = self.head(x)
-            return x
+        def forward(self, idx, state=None):
+            features = self._forward_features(idx, state)
+            if state is None:
+                return self.head(features)
+            hidden, state_out = features
+            return self.head(hidden), state_out
 
         def training_step(self, batch, batch_idx):
             idx, targets = batch
+            if getattr(self.args, 'train_type', 'normal') == 'state':
+                return self._state_training_step(idx, targets)
             logits = self(idx)
 
             ############################################################
